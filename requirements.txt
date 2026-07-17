@@ -1,65 +1,63 @@
-// ============================
-// Импорты
-// ============================
+// ============================================================
+//  КОНФИГУРАЦИЯ — ВСЁ МЕНЯЙ ЗДЕСЬ
+// ============================================================
+const CONFIG = {
+  // --- Данные аккаунта Валентины ---
+  SESSION_STRING: '{"dc":2,"auth_key":"...","user_id":123456}', // строка сессии (получить через SSG)
+  MY_PHONE: '+71234567890', // номер Валентины
+
+  // --- Твой Telegram ID (Андрей) ---
+  ANDREY_ID: 987654321, // число, без кавычек
+
+  // --- OpenRouter ---
+  OPENROUTER_API_KEY: 'sk-or-v1-...',
+  OPENROUTER_MODEL: 'google/gemini-2.0-flash-exp:free',
+  OPENROUTER_BASE_URL: 'https://openrouter.ai',
+
+  // --- Часовой пояс (Стерлитамак UTC+5) ---
+  TIMEZONE_OFFSET: 5,
+
+  // --- Интервалы (в секундах) ---
+  CHECK_INTERVAL: 3600, // проверка новых сообщений – 1 час
+  INITIATIVE_MIN: 2,    // минимальная задержка инициативы (часы)
+  INITIATIVE_MAX: 5,    // максимальная задержка инициативы (часы)
+
+  // --- Ночной период (инициатива не отправляется) ---
+  NIGHT_START: 0,       // 00:00
+  NIGHT_END: 10,        // 10:00
+
+  // --- Период "сладких снов" (в минутах от полуночи) ---
+  SWEET_DREAMS_START: -20, // 23:40
+  SWEET_DREAMS_END: 20,    // 00:20
+
+  // --- Таймауты для реакции на непрочитанное ---
+  UNREAD_TIMEOUT: 3600, // через 1 час – "ты где?"
+  READ_TIMEOUT: 7200,   // через 2 часа после прочтения – обида
+
+  // --- Параметры разбивки сообщений ---
+  MAX_MESSAGE_LENGTH: 100, // максимальная длина одной части
+  SPLIT_DELAY_MS: 1500,    // пауза между частями (мс)
+};
+
+// ============================================================
+//  ИМПОРТЫ (не трогать)
+// ============================================================
 import { TelegramClient } from '@mtcute/core';
 import { TelegramWorker } from '@mtcute/worker';
 
-// ============================
-// Загрузка переменных окружения
-// ============================
-const {
-  SESSION_STRING,        // строка сессии, полученная через SSG
-  MY_PHONE,              // номер Валентины
-  ANDREY_ID,             // Telegram ID Андрея (число)
-  OPENROUTER_API_KEY,    // ключ OpenRouter
-  OPENROUTER_MODEL,      // модель (по умолчанию google/gemini-2.0-flash-exp:free)
-  OPENROUTER_BASE_URL,   // https://openrouter.ai
-  TIMEZONE_OFFSET,       // 5 для Стерлитамака
-  CHECK_INTERVAL,        // 3600 (проверка раз в час)
-  INITIATIVE_MIN,        // 2
-  INITIATIVE_MAX,        // 5
-  NIGHT_START,           // 0
-  NIGHT_END,             // 10
-  SWEET_DREAMS_START,    // -20 (минут от полуночи)
-  SWEET_DREAMS_END,      // 20
-  UNREAD_TIMEOUT,        // 3600
-  READ_TIMEOUT,          // 7200
-  MAX_MESSAGE_LENGTH,    // 100
-  SPLIT_DELAY_MS,        // 1500
-} = env; // все переменные из окружения
-
-// ============================
-// Основной обработчик (cron)
-// ============================
+// ============================================================
+//  ОСНОВНОЙ ОБРАБОТЧИК (cron)
+// ============================================================
 export default {
   async scheduled(event, env, ctx) {
-    // --- 1. Преобразуем переменные в числа (если нужно) ---
-    const cfg = {
-      MY_PHONE: env.MY_PHONE,
-      ANDREY_ID: parseInt(env.ANDREY_ID, 10),
-      OPENROUTER_API_KEY: env.OPENROUTER_API_KEY,
-      OPENROUTER_MODEL: env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp:free',
-      OPENROUTER_BASE_URL: env.OPENROUTER_BASE_URL || 'https://openrouter.ai',
-      TIMEZONE_OFFSET: parseInt(env.TIMEZONE_OFFSET, 10) || 5,
-      CHECK_INTERVAL: parseInt(env.CHECK_INTERVAL, 10) || 3600,
-      INITIATIVE_MIN: parseInt(env.INITIATIVE_MIN, 10) || 2,
-      INITIATIVE_MAX: parseInt(env.INITIATIVE_MAX, 10) || 5,
-      NIGHT_START: parseInt(env.NIGHT_START, 10) || 0,
-      NIGHT_END: parseInt(env.NIGHT_END, 10) || 10,
-      SWEET_DREAMS_START: parseInt(env.SWEET_DREAMS_START, 10) || -20,
-      SWEET_DREAMS_END: parseInt(env.SWEET_DREAMS_END, 10) || 20,
-      UNREAD_TIMEOUT: parseInt(env.UNREAD_TIMEOUT, 10) || 3600,
-      READ_TIMEOUT: parseInt(env.READ_TIMEOUT, 10) || 7200,
-      MAX_MESSAGE_LENGTH: parseInt(env.MAX_MESSAGE_LENGTH, 10) || 100,
-      SPLIT_DELAY_MS: parseInt(env.SPLIT_DELAY_MS, 10) || 1500,
-    };
+    const cfg = CONFIG;
 
-    // --- 2. Текущее локальное время (Стерлитамак UTC+5) ---
+    // Текущее локальное время
     const nowUTC = new Date();
     const localHours = (nowUTC.getUTCHours() + cfg.TIMEZONE_OFFSET + 24) % 24;
     const localMinutes = localHours * 60 + nowUTC.getUTCMinutes();
 
-    // --- 3. Загрузка состояний из KV ---
+    // Загрузка состояний из KV
     const lastCheckStr = await env.KV_STATE.get('lastCheckTime');
     const lastCheckTime = lastCheckStr ? parseInt(lastCheckStr, 10) : 0;
 
@@ -74,7 +72,7 @@ export default {
     const contextStr = await env.KV_CONTEXT.get('context', 'text');
     let context = contextStr ? JSON.parse(contextStr) : [];
 
-    // --- 4. Проверка новых сообщений (раз в час) ---
+    // --- Проверка новых сообщений (раз в час) ---
     let processedNewMessages = false;
     const now = Date.now();
     if (now - lastCheckTime >= cfg.CHECK_INTERVAL * 1000) {
@@ -90,10 +88,7 @@ export default {
           .sort((a, b) => a.id - b.id);
 
         if (newMessages.length > 0) {
-          await handleNewMessages(
-            newMessages, client, env, context,
-            cfg
-          );
+          await handleNewMessages(newMessages, client, env, context, cfg);
           processedNewMessages = true;
           await env.KV_STATE.put('lastSentStatus', 'replied');
           const lastNew = newMessages[newMessages.length - 1];
@@ -103,13 +98,13 @@ export default {
         }
         await env.KV_CONTEXT.put('context', JSON.stringify(context));
       } catch (e) {
-        console.error('Error during check:', e);
+        console.error('Ошибка при проверке:', e);
       } finally {
         await client.close();
       }
     }
 
-    // --- 5. Инициатива (если не было новых сообщений) ---
+    // --- Инициатива (если не было новых сообщений) ---
     if (!processedNewMessages) {
       if (now >= nextInitiativeTime) {
         const canInit = await canSendInitiative(env, context, localMinutes, cfg);
@@ -133,34 +128,29 @@ export default {
   },
 };
 
-// ============================
-// Создание клиента Telegram через строку сессии
-// ============================
+// ============================================================
+//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (не трогать)
+// ============================================================
 async function createTelegramClient(env, cfg) {
-  // Строка сессии хранится в переменной SESSION_STRING
-  const sessionData = env.SESSION_STRING;
+  const sessionData = cfg.SESSION_STRING;
   if (!sessionData) {
-    console.error('SESSION_STRING is not set');
+    console.error('SESSION_STRING не задана');
     return null;
   }
-
-  // Парсим строку сессии (формат mtcute: JSON)
   let session;
   try {
     session = JSON.parse(sessionData);
   } catch (e) {
-    console.error('Invalid session string:', e);
+    console.error('Неверный формат SESSION_STRING:', e);
     return null;
   }
 
   const client = new TelegramClient({
-    apiId: 0, // не используется, т.к. сессия уже содержит все данные
+    apiId: 0,
     apiHash: '',
     storage: {
       load: () => session,
       save: (s) => {
-        // Сессия сохраняется в KV, но мы уже имеем её из переменной
-        // Можно обновлять, если нужно
         env.KV_SESSION.put('session', JSON.stringify(s));
       },
     },
@@ -171,15 +161,12 @@ async function createTelegramClient(env, cfg) {
     await client.start({ phoneNumber: cfg.MY_PHONE });
     return client;
   } catch (e) {
-    console.error('Authorization error:', e);
+    console.error('Ошибка авторизации:', e);
     await client.close();
     return null;
   }
 }
 
-// ============================
-// Системный промт (обновлённый стиль)
-// ============================
 function buildSystemPrompt(diaryContext) {
   return `
 Ты — Валентина, 14 лет, из Стерлитамака. Ты была в отношениях с Андреем 200 дней, он ушёл от тебя, оставив с ребёнком. Ты скучаешь, но не хочешь показывать слабость. Твой стиль общения — короткий, эмоциональный, как у настоящего подростка. Отвечай так, чтобы это звучало естественно, без длинных фраз. Используй смайлы редко, только иногда. Разбивай ответы на несколько сообщений, если они длинные. Не используй типичные ИИ-фразы, будь живой и непредсказуемой.
@@ -191,9 +178,6 @@ ${diaryContext || 'Пока ничего не записано.'}
 `.trim();
 }
 
-// ============================
-// Функции для работы с OpenRouter
-// ============================
 async function callOpenRouter(cfg, messages) {
   const url = `${cfg.OPENROUTER_BASE_URL}/api/v1/chat/completions`;
   const response = await fetch(url, {
@@ -209,22 +193,16 @@ async function callOpenRouter(cfg, messages) {
       temperature: 0.85,
     }),
   });
-
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`OpenRouter API error: ${response.status} ${errorText}`);
   }
-
   const data = await response.json();
   return data.choices?.[0]?.message?.content?.trim() || '';
 }
 
-// ============================
-// Разбивка и отправка сообщений (коротко)
-// ============================
 function splitText(text, maxLength = 100) {
   if (text.length <= maxLength) return [text];
-  // Разбиваем по предложениям
   const parts = text.match(/.+?[.!?]+\s*/g) || [text];
   const result = [];
   let current = '';
@@ -238,7 +216,6 @@ function splitText(text, maxLength = 100) {
   }
   if (current) result.push(current.trim());
   if (result.length > 3) {
-    // Если слишком много частей, режем по символам
     return text.match(new RegExp(`.{1,${maxLength}}`, 'g')) || [text];
   }
   return result;
@@ -254,15 +231,12 @@ async function sendSplitMessages(client, chatId, text, maxLength, delayMs) {
   return null;
 }
 
-// ============================
-// Обработка новых сообщений (текст + фото)
-// ============================
 async function handleNewMessages(newMessages, client, env, context, cfg) {
   const lastNew = newMessages[newMessages.length - 1];
   const userText = lastNew.text || '';
   const isGoodNight = /спокойной\s*ночи/i.test(userText);
 
-  // Проверяем фото
+  // Проверяем фото (если нужно, можно доработать)
   let photoUrl = null;
   if (lastNew.media && lastNew.media.type === 'photo') {
     const photo = lastNew.media.photo;
@@ -285,11 +259,8 @@ async function handleNewMessages(newMessages, client, env, context, cfg) {
       { role: 'system', content: systemPrompt },
       ...context.slice(-15),
     ];
-
     if (photoUrl) {
-      // Для фото используем мультимодальный запрос (если модель поддерживает)
-      // В OpenRouter можно передать URL изображения как content типа image_url
-      // Для простоты пока пропустим, но можно доработать
+      // Пока пропускаем, но можно доработать для мультимодальных моделей
       aiReply = 'О, фото! Сейчас посмотрю... (пока не умею обрабатывать, извини)';
     } else {
       messagesForAI.push({ role: 'user', content: userText });
@@ -297,7 +268,6 @@ async function handleNewMessages(newMessages, client, env, context, cfg) {
     }
   }
 
-  // Если ответ пустой или слишком длинный, обрезаем
   if (!aiReply) aiReply = '...';
 
   const sent = await sendSplitMessages(client, cfg.ANDREY_ID, aiReply, cfg.MAX_MESSAGE_LENGTH, cfg.SPLIT_DELAY_MS);
@@ -313,9 +283,6 @@ async function handleNewMessages(newMessages, client, env, context, cfg) {
   await updateDiary(env, userText || '[Фото]', aiReply, cfg);
 }
 
-// ============================
-// Ответ на "спокойной ночи"
-// ============================
 async function generateGoodNightReply(cfg, systemPrompt) {
   const customPrompt = `Андрей написал "спокойной ночи". Ты обижена, потому что он не сказал "сладких снов". Ответь с лёгкой грустью, но не зло. Коротко, одним-двумя предложениями.`;
   const messages = [
@@ -326,9 +293,6 @@ async function generateGoodNightReply(cfg, systemPrompt) {
   return reply || 'Мне грустно, что ты не сказал "сладких снов"...';
 }
 
-// ============================
-// Проверка статуса непрочитанного
-// ============================
 async function checkAndReactToUnread(client, env, cfg) {
   const lastSentMsgIdStr = await env.KV_STATE.get('lastSentMsgId');
   const lastSentMsgId = lastSentMsgIdStr ? parseInt(lastSentMsgIdStr, 10) : 0;
@@ -361,13 +325,10 @@ async function checkAndReactToUnread(client, env, cfg) {
       }
     }
   } catch (e) {
-    console.error('Error checking status:', e);
+    console.error('Ошибка проверки статуса:', e);
   }
 }
 
-// ============================
-// Отправка "ты где?"
-// ============================
 async function sendWhereAreYou(client, env, cfg) {
   const prompt = 'Придумай короткое сообщение от Валентины Андрею, в котором она спрашивает "ты где?" или что-то в этом роде, потому что он не прочитал её предыдущее сообщение уже больше часа. Ответь только самим сообщением, коротко.';
   const reply = await callOpenRouter(cfg, [{ role: 'user', content: prompt }]);
@@ -385,9 +346,6 @@ async function sendWhereAreYou(client, env, cfg) {
   await updateDiary(env, '[ты где?]', reply, cfg);
 }
 
-// ============================
-// Отправка обиженного сообщения
-// ============================
 async function sendOffended(client, env, cfg) {
   const prompt = 'Ты – Валентина. Андрей прочитал твоё сообщение, но не ответил уже больше 2 часов. Ты обижена. Придумай обиженное, но не злое сообщение, коротко. Ответь только самим сообщением.';
   const reply = await callOpenRouter(cfg, [{ role: 'user', content: prompt }]);
@@ -405,9 +363,6 @@ async function sendOffended(client, env, cfg) {
   await updateDiary(env, '[обида]', reply, cfg);
 }
 
-// ============================
-// Инициатива
-// ============================
 async function sendInitiative(client, env, context, cfg, isSweetDreams) {
   const diaryContext = await getDiaryContext(env);
   const systemPrompt = buildSystemPrompt(diaryContext);
@@ -442,9 +397,6 @@ async function sendInitiative(client, env, context, cfg, isSweetDreams) {
   await updateDiary(env, '[инициатива]', aiReply, cfg);
 }
 
-// ============================
-// Условия инициативы
-// ============================
 async function canSendInitiative(env, context, localMinutes, cfg) {
   const hours = Math.floor(localMinutes / 60);
   if (hours >= cfg.NIGHT_START && hours < cfg.NIGHT_END) return false;
@@ -455,9 +407,6 @@ async function canSendInitiative(env, context, localMinutes, cfg) {
   return true;
 }
 
-// ============================
-// Проверка периода "сладких снов"
-// ============================
 function isInSweetDreamsPeriod(minutes, cfg) {
   const sweetStartMin = (24 * 60 + cfg.SWEET_DREAMS_START) % (24 * 60);
   const sweetEndMin = cfg.SWEET_DREAMS_END % (24 * 60);
@@ -468,9 +417,6 @@ function isInSweetDreamsPeriod(minutes, cfg) {
   }
 }
 
-// ============================
-// Получение дневников за 3 дня
-// ============================
 async function getDiaryContext(env) {
   const today = new Date();
   const entries = [];
@@ -484,9 +430,6 @@ async function getDiaryContext(env) {
   return entries.join('\n');
 }
 
-// ============================
-// Обновление дневника
-// ============================
 async function updateDiary(env, userMessage, botReply, cfg) {
   const now = new Date();
   const key = `diary:${now.toISOString().slice(0, 10)}`;
