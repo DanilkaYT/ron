@@ -1,47 +1,40 @@
 // ============================================================
-//  КОНФИГУРАЦИЯ — ВСЁ МЕНЯЙ ЗДЕСЬ
+//  КОНФИГУРАЦИЯ — ИЗМЕНЯЙ ЗДЕСЬ
 // ============================================================
 const CONFIG = {
-  // --- Данные аккаунта Валентины ---
-  API_ID: 123456,              // твой api_id
-  API_HASH: 'your_api_hash',   // твой api_hash
+  // --- Данные аккаунта Валентины (используем api_id/api_hash) ---
+  API_ID: 123456,              // замени на свой api_id
+  API_HASH: 'your_api_hash',   // замени на свой api_hash
   MY_PHONE: '+71234567890',    // номер Валентины
-  TELEGRAM_CODE: '12345',      // код для первого входа (удалить после успешного входа)
+  TELEGRAM_CODE: '12345',      // код для первого входа (удали после успешного входа)
 
   // --- Твой Telegram ID (Андрей) ---
-  ANDREY_ID: 987654321,        // число
+  ANDREY_ID: 987654321,
 
   // --- OpenRouter ---
   OPENROUTER_API_KEY: 'sk-or-v1-...',
-  OPENROUTER_MODEL: 'google/gemini-2.0-flash-exp:free', // или другая мультимодальная
+  OPENROUTER_MODEL: 'google/gemini-2.0-flash-exp:free',
   OPENROUTER_BASE_URL: 'https://openrouter.ai',
 
   // --- Часовой пояс (Стерлитамак UTC+5) ---
   TIMEZONE_OFFSET: 5,
 
   // --- Интервалы (в секундах) ---
-  CHECK_INTERVAL: 3600,          // проверка новых сообщений – 1 час
-  INITIATIVE_MIN: 2,             // минимальная задержка инициативы (часы)
-  INITIATIVE_MAX: 5,             // максимальная задержка инициативы (часы)
-  SLEEP_TIME: 3,                 // час ночи (0-23) для консолидации сна
+  CHECK_INTERVAL: 3600,
+  INITIATIVE_MIN: 2,
+  INITIATIVE_MAX: 5,
+  SLEEP_TIME: 3, // час ночи для консолидации сна
 
-  // --- Ночной период (инициатива не отправляется) ---
-  NIGHT_START: 0,                // 00:00
-  NIGHT_END: 10,                 // 10:00
+  NIGHT_START: 0,
+  NIGHT_END: 10,
+  SWEET_DREAMS_START: -20,
+  SWEET_DREAMS_END: 20,
+  UNREAD_TIMEOUT: 3600,
+  READ_TIMEOUT: 7200,
 
-  // --- Период "сладких снов" (в минутах от полуночи) ---
-  SWEET_DREAMS_START: -20,       // 23:40
-  SWEET_DREAMS_END: 20,          // 00:20
+  MAX_MESSAGE_LENGTH: 100,
+  SPLIT_DELAY_MS: 1500,
 
-  // --- Таймауты для реакции на непрочитанное ---
-  UNREAD_TIMEOUT: 3600,          // через 1 час – "ты где?"
-  READ_TIMEOUT: 7200,            // через 2 часа после прочтения – обида
-
-  // --- Параметры разбивки сообщений ---
-  MAX_MESSAGE_LENGTH: 100,       // максимальная длина одной части
-  SPLIT_DELAY_MS: 1500,          // пауза между частями (мс)
-
-  // --- Список случайных ивентов (Валентина может сообщать о них) ---
   EVENTS: [
     'пошла гулять в парк',
     'готовлю ужин',
@@ -57,31 +50,28 @@ const CONFIG = {
 };
 
 // ============================================================
-//  ИМПОРТЫ (не трогать)
+//  ИМПОРТЫ из CDN (исправлено)
 // ============================================================
-import { TelegramClient } from '@mtcute/core';
-import { TelegramWorker } from '@mtcute/worker';
+import { TelegramClient } from 'https://esm.sh/@mtcute/core@0.32.0';
+import { TelegramWorker } from 'https://esm.sh/@mtcute/worker@0.32.0';
 
 // ============================================================
-//  ОСНОВНОЙ ОБРАБОТЧИК (cron)
+//  ОСНОВНОЙ ОБРАБОТЧИК
 // ============================================================
 export default {
   async scheduled(event, env, ctx) {
     const cfg = CONFIG;
-
-    // Текущее локальное время
     const nowUTC = new Date();
     const localHours = (nowUTC.getUTCHours() + cfg.TIMEZONE_OFFSET + 24) % 24;
     const localMinutes = localHours * 60 + nowUTC.getUTCMinutes();
 
-    // --- Проверка, не пора ли "спать" (консолидация дневника) ---
+    // --- Сон (консолидация) в заданный час ---
     if (localHours === cfg.SLEEP_TIME && localMinutes < 5) {
       await sleepConsolidation(env, cfg);
-      // после сна обновим время последнего сна, чтобы не повторять
       await env.KV_STATE.put('lastSleepTime', String(Date.now()));
     }
 
-    // Загрузка состояний из KV
+    // Загружаем состояния
     const lastCheckStr = await env.KV_STATE.get('lastCheckTime');
     const lastCheckTime = lastCheckStr ? parseInt(lastCheckStr, 10) : 0;
 
@@ -91,15 +81,11 @@ export default {
     const lastMsgIdStr = await env.KV_STATE.get('lastMsgId');
     const lastMsgId = lastMsgIdStr ? parseInt(lastMsgIdStr, 10) : 0;
 
-    const lastSentStatus = await env.KV_STATE.get('lastSentStatus') || '';
-
-    // Загружаем контекст (историю диалога)
     const contextStr = await env.KV_CONTEXT.get('context', 'text');
     let context = contextStr ? JSON.parse(contextStr) : [];
 
-    // Загружаем эмоциональное состояние
-    const emotionStr = await env.KV_STATE.get('emotion') || 'neutral';
-    const moodStr = await env.KV_STATE.get('mood') || 'спокойное';
+    const emotion = await env.KV_STATE.get('emotion') || 'neutral';
+    const mood = await env.KV_STATE.get('mood') || 'спокойное';
 
     // --- Проверка новых сообщений (раз в час) ---
     let processedNewMessages = false;
@@ -111,28 +97,18 @@ export default {
       if (!client) return;
 
       try {
-        // Получаем обновления (последние сообщения) из всех чатов, где есть Валентина
-        // Для простоты будем проверять личные сообщения и группы, в которых она состоит
-        // Получим диалоги, где есть непрочитанные или новые сообщения
-        // Но мы не можем легко получить все диалоги с новыми сообщениями, поэтому упростим:
-        // проверяем только личные сообщения от Андрея и группы, где она участвовала.
-        // Вместо этого можно получать обновления через getUpdates, но это сложнее.
-        // Оставим как раньше: проверяем личные сообщения от Андрея.
         const messages = await client.getMessages(cfg.ANDREY_ID, { limit: 30 });
         const newMessages = messages
           .filter(m => m.fromId && m.fromId.id === cfg.ANDREY_ID && m.id > lastMsgId)
           .sort((a, b) => a.id - b.id);
 
         if (newMessages.length > 0) {
-          await handleNewMessages(newMessages, client, env, context, cfg, emotionStr, moodStr);
+          await handleNewMessages(newMessages, client, env, context, cfg, emotion, mood);
           processedNewMessages = true;
           await env.KV_STATE.put('lastSentStatus', 'replied');
           const lastNew = newMessages[newMessages.length - 1];
           await env.KV_STATE.put('lastMsgId', String(lastNew.id));
         } else {
-          // Также нужно проверить сообщения от других пользователей и из групп.
-          // Для этого можно получить все диалоги и проверить новые сообщения.
-          // Реализуем позже, если потребуется.
           await checkAndReactToUnread(client, env, cfg);
         }
         await env.KV_CONTEXT.put('context', JSON.stringify(context));
@@ -143,7 +119,7 @@ export default {
       }
     }
 
-    // --- Инициатива (если не было новых сообщений) ---
+    // --- Инициатива ---
     if (!processedNewMessages) {
       if (now >= nextInitiativeTime) {
         const canInit = await canSendInitiative(env, context, localMinutes, cfg);
@@ -152,25 +128,22 @@ export default {
           const client = await createTelegramClient(env, cfg);
           if (client) {
             try {
-              await sendInitiative(client, env, context, cfg, isSweetDreams, emotionStr, moodStr);
+              await sendInitiative(client, env, context, cfg, isSweetDreams, emotion, mood);
               await env.KV_CONTEXT.put('context', JSON.stringify(context));
             } finally {
               await client.close();
             }
           }
         }
-        // Пересчитываем время следующей инициативы
         const delayHours = cfg.INITIATIVE_MIN + Math.random() * (cfg.INITIATIVE_MAX - cfg.INITIATIVE_MIN);
         const nextInit = now + delayHours * 3600 * 1000;
         await env.KV_STATE.put('nextInitiativeTime', String(nextInit));
       }
     }
 
-    // --- Случайный ивент (может произойти в любое время) ---
-    // Вероятность 10% при каждом запуске (но не ночью)
+    // --- Случайный ивент (10%) ---
     if (Math.random() < 0.1 && !isNightTime(localMinutes, cfg)) {
       const event = cfg.EVENTS[Math.floor(Math.random() * cfg.EVENTS.length)];
-      // Отправим Андрею сообщение о событии (если он не в игноре)
       const client = await createTelegramClient(env, cfg);
       if (client) {
         try {
@@ -184,10 +157,9 @@ export default {
 };
 
 // ============================================================
-//  СОЗДАНИЕ КЛИЕНТА TELEGRAM (с сессией)
+//  ФУНКЦИИ ДЛЯ РАБОТЫ С TELEGRAM
 // ============================================================
 async function createTelegramClient(env, cfg) {
-  // Пытаемся загрузить сессию из KV
   const sessionData = await env.KV_SESSION.get('session', 'text');
   let session = sessionData ? JSON.parse(sessionData) : null;
 
@@ -210,18 +182,15 @@ async function createTelegramClient(env, cfg) {
       await client.start({ phoneNumber: cfg.MY_PHONE });
     } else {
       if (!cfg.TELEGRAM_CODE) {
-        console.error('TELEGRAM_CODE не задан для первого входа');
+        console.error('TELEGRAM_CODE не задан');
         return null;
       }
       await client.start({
         phoneNumber: cfg.MY_PHONE,
         code: () => cfg.TELEGRAM_CODE,
       });
-      // Сохраняем сессию после успешного входа
       const exported = await client.storage.export();
       await env.KV_SESSION.put('session', JSON.stringify(exported));
-      // После успешного входа можно удалить код из конфига, но в Workers конфиг статичен,
-      // поэтому просто закомментируем или удалим вручную.
     }
     return client;
   } catch (e) {
@@ -232,17 +201,14 @@ async function createTelegramClient(env, cfg) {
 }
 
 // ============================================================
-//  СИСТЕМНЫЙ ПРОМТ (с учетом эмоций, рабочей памяти и личности)
+//  СИСТЕМНЫЙ ПРОМТ (с эмоциями, рабочей памятью)
 // ============================================================
-function buildSystemPrompt(diaryContext, workingMemory, emotion, mood, isAndrey = true) {
+function buildSystemPrompt(diaryContext, workingMemory, emotion, mood, isAndrey) {
   const identity = isAndrey
-    ? `Ты — Валентина, 14 лет, из Стерлитамака. Ты была в отношениях с Андреем 200 дней, он ушёл от тебя, оставив с ребёнком. Ты скучаешь, но не хочешь показывать слабость. Твой стиль общения с Андреем — короткий, эмоциональный, с лёгкой обидой и ностальгией. Ты можешь быть саркастичной, но не злой. Отвечай так, чтобы это звучало естественно, без длинных фраз.`
+    ? `Ты — Валентина, 14 лет, из Стерлитамака. Ты была в отношениях с Андреем 200 дней, он ушёл от тебя, оставив с ребёнком. Ты скучаешь, но не хочешь показывать слабость. Твой стиль общения с Андреем — короткий, эмоциональный, с лёгкой обидой и ностальгией. Ты можешь быть саркастичной, но не злой.`
     : `Ты — Валентина, 14-летняя девушка из Стерлитамака. Ты общительная, дружелюбная, но не раскрываешь личную историю с Андреем. Общаешься с другими как обычный подросток, вежливо, иногда с юмором.`;
 
-  let emotionText = '';
-  if (emotion !== 'neutral') {
-    emotionText = `Сейчас ты чувствуешь ${emotion}. Это влияет на твой тон.`;
-  }
+  let emotionText = emotion !== 'neutral' ? `Сейчас ты чувствуешь ${emotion}.` : '';
   let moodText = `Твоё общее настроение: ${mood}.`;
 
   return `
@@ -256,12 +222,12 @@ ${diaryContext || 'Пока ничего не записано.'}
 Важные вещи, которые нужно помнить (рабочая память):
 ${workingMemory || 'Ничего важного.'}
 
-Отвечай коротко, естественно, без маркдауна. Если нужно разбей ответ на несколько сообщений.
+Отвечай коротко, естественно, без маркдауна. Если нужно, разбей ответ на несколько сообщений.
 `.trim();
 }
 
 // ============================================================
-//  ВЫЗОВ OPENROUTER (универсальный)
+//  ВЫЗОВ OPENROUTER
 // ============================================================
 async function callOpenRouter(cfg, messages) {
   const url = `${cfg.OPENROUTER_BASE_URL}/api/v1/chat/completions`;
@@ -287,7 +253,7 @@ async function callOpenRouter(cfg, messages) {
 }
 
 // ============================================================
-//  РАЗБИВКА СООБЩЕНИЙ НА ЧАСТИ
+//  РАЗБИВКА СООБЩЕНИЙ
 // ============================================================
 function splitText(text, maxLength = 100) {
   if (text.length <= maxLength) return [text];
@@ -320,18 +286,15 @@ async function sendSplitMessages(client, chatId, text, maxLength, delayMs) {
 }
 
 // ============================================================
-//  ОБРАБОТКА НОВЫХ СООБЩЕНИЙ (от Андрея)
+//  ОБРАБОТКА НОВЫХ СООБЩЕНИЙ
 // ============================================================
 async function handleNewMessages(newMessages, client, env, context, cfg, emotion, mood) {
   const lastNew = newMessages[newMessages.length - 1];
   const userText = lastNew.text || '';
   const isGoodNight = /спокойной\s*ночи/i.test(userText);
 
-  // Загружаем дневник и рабочую память
   const diaryContext = await getDiaryContext(env);
   const workingMemory = await env.KV_WORKING_MEMORY.get('workingMemory', 'text') || '';
-
-  // Формируем промт для Андрея
   const systemPrompt = buildSystemPrompt(diaryContext, workingMemory, emotion, mood, true);
 
   context.push({ role: 'user', content: userText });
@@ -361,17 +324,10 @@ async function handleNewMessages(newMessages, client, env, context, cfg, emotion
   if (context.length > 20) context = context.slice(-20);
   await env.KV_CONTEXT.put('context', JSON.stringify(context));
 
-  // Обновляем эмоциональное состояние (можно попросить модель определить эмоцию, но для простоты оставим как есть)
-  // Запись в дневник
   await updateDiary(env, userText, aiReply, cfg, emotion, mood);
-
-  // Обновляем рабочую память
   await updateWorkingMemory(env, userText, aiReply, cfg);
 }
 
-// ============================================================
-//  ОТВЕТ НА "СПОКОЙНОЙ НОЧИ" (обида)
-// ============================================================
 async function generateGoodNightReply(cfg, systemPrompt) {
   const customPrompt = `Андрей написал "спокойной ночи". Ты обижена, потому что он не сказал "сладких снов". Ответь коротко, с лёгкой грустью.`;
   const messages = [
@@ -383,7 +339,7 @@ async function generateGoodNightReply(cfg, systemPrompt) {
 }
 
 // ============================================================
-//  ПРОВЕРКА НЕПРОЧИТАННЫХ СООБЩЕНИЙ (ты где? / обида)
+//  ПРОВЕРКА НЕПРОЧИТАННОГО
 // ============================================================
 async function checkAndReactToUnread(client, env, cfg) {
   const lastSentMsgIdStr = await env.KV_STATE.get('lastSentMsgId');
@@ -421,9 +377,6 @@ async function checkAndReactToUnread(client, env, cfg) {
   }
 }
 
-// ============================================================
-//  ОТПРАВКА "ТЫ ГДЕ?"
-// ============================================================
 async function sendWhereAreYou(client, env, cfg) {
   const prompt = 'Придумай короткое сообщение от Валентины Андрею, в котором она спрашивает "ты где?" или что-то в этом роде, потому что он не прочитал её предыдущее сообщение уже больше часа. Ответь только самим сообщением, коротко.';
   const reply = await callOpenRouter(cfg, [{ role: 'user', content: prompt }]);
@@ -433,14 +386,9 @@ async function sendWhereAreYou(client, env, cfg) {
     await env.KV_STATE.put('lastSentTime', String(Date.now()));
     await env.KV_STATE.put('lastSentStatus', 'asked_where');
   }
-  // Добавим в контекст и дневник
   await updateDiary(env, '[ты где?]', reply, cfg, 'neutral', 'спокойное');
-  // Обновим рабочую память (если нужно)
 }
 
-// ============================================================
-//  ОТПРАВКА ОБИЖЕННОГО СООБЩЕНИЯ
-// ============================================================
 async function sendOffended(client, env, cfg) {
   const prompt = 'Ты – Валентина. Андрей прочитал твоё сообщение, но не ответил уже больше 2 часов. Ты обижена. Придумай обиженное, но не злое сообщение, коротко.';
   const reply = await callOpenRouter(cfg, [{ role: 'user', content: prompt }]);
@@ -454,7 +402,7 @@ async function sendOffended(client, env, cfg) {
 }
 
 // ============================================================
-//  ИНИЦИАТИВА (случайное сообщение Андрею или в группы)
+//  ИНИЦИАТИВА
 // ============================================================
 async function sendInitiative(client, env, context, cfg, isSweetDreams, emotion, mood) {
   const diaryContext = await getDiaryContext(env);
@@ -493,7 +441,7 @@ async function sendInitiative(client, env, context, cfg, isSweetDreams, emotion,
 }
 
 // ============================================================
-//  УСЛОВИЯ ДЛЯ ИНИЦИАТИВЫ
+//  УСЛОВИЯ ИНИЦИАТИВЫ
 // ============================================================
 async function canSendInitiative(env, context, localMinutes, cfg) {
   const hours = Math.floor(localMinutes / 60);
@@ -505,9 +453,6 @@ async function canSendInitiative(env, context, localMinutes, cfg) {
   return true;
 }
 
-// ============================================================
-//  ПРОВЕРКА НОЧНОГО ВРЕМЕНИ
-// ============================================================
 function isNightTime(minutes, cfg) {
   const hours = Math.floor(minutes / 60);
   return hours >= cfg.NIGHT_START && hours < cfg.NIGHT_END;
@@ -524,52 +469,42 @@ function isInSweetDreamsPeriod(minutes, cfg) {
 }
 
 // ============================================================
-//  РАБОТА С ДНЕВНИКОМ (чтение, запись, консолидация сна)
+//  РАБОТА С ДНЕВНИКОМ
 // ============================================================
 async function getDiaryContext(env) {
-  // Загружаем последние 5 записей дневника (сортировка по времени)
-  const diaryKeys = await env.KV_DIARY.list({ limit: 10 });
-  let entries = [];
-  for (const key of diaryKeys.keys) {
-    const entry = await env.KV_DIARY.get(key.name, 'text');
-    if (entry) {
+  const entries = [];
+  const keys = await env.KV_DIARY.list({ limit: 5 });
+  for (const key of keys.keys) {
+    const entryData = await env.KV_DIARY.get(key.name, 'text');
+    if (entryData) {
       try {
-        const data = JSON.parse(entry);
-        entries.push(data);
+        const entry = JSON.parse(entryData);
+        entries.push(entry.content);
       } catch {
-        // если не JSON, считаем как текст
-        entries.push({ content: entry, timestamp: key.name });
+        entries.push(entryData);
       }
     }
   }
-  // сортируем по времени (последние сверху)
-  entries.sort((a, b) => b.timestamp - a.timestamp);
-  // Возвращаем первые 3 записи как текст
-  return entries.slice(0, 3).map(e => e.content).join('\n');
+  return entries.slice(0, 3).join('\n');
 }
 
 async function updateDiary(env, userMessage, botReply, cfg, emotion, mood) {
   const now = new Date();
-  const key = `diary:${now.toISOString().slice(0, 10)}`;
   const timeStr = now.toTimeString().slice(0, 5);
-  // Формируем запись: эмоция, настроение, содержание
   const entry = {
     timestamp: now.getTime(),
     content: `[${timeStr}] Андрей: "${userMessage}" | Валентина: "${botReply}" | Эмоция: ${emotion} | Настроение: ${mood}`,
   };
-  // Сохраняем в KV (можно хранить список, но для простоты добавим как отдельную запись)
   await env.KV_DIARY.put(`diary:${now.getTime()}`, JSON.stringify(entry));
 }
 
 // ============================================================
-//  КОНСОЛИДАЦИЯ СНА (переработка дневника)
+//  КОНСОЛИДАЦИЯ СНА
 // ============================================================
 async function sleepConsolidation(env, cfg) {
   console.log('Начинается консолидация сна...');
-  // Загружаем все записи дневника за последние 3 дня
   const now = new Date();
-  const threeDaysAgo = new Date(now);
-  threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+  const threeDaysAgo = now.getTime() - 3 * 24 * 3600 * 1000;
   const keys = await env.KV_DIARY.list();
   let entries = [];
   for (const key of keys.keys) {
@@ -577,58 +512,40 @@ async function sleepConsolidation(env, cfg) {
     if (entryData) {
       try {
         const entry = JSON.parse(entryData);
-        if (entry.timestamp > threeDaysAgo.getTime()) {
-          entries.push(entry);
+        if (entry.timestamp > threeDaysAgo) {
+          entries.push(entry.content);
         }
-      } catch {
-        // игнорируем невалидные
-      }
+      } catch {}
     }
   }
-  if (entries.length === 0) {
-    console.log('Нет записей для консолидации.');
-    return;
-  }
+  if (entries.length === 0) return;
 
-  // Группируем записи по смыслу (через эмбеддинги не можем, поэтому используем LLM)
-  // Просто попросим модель сжать все записи в краткий список важных фактов и эмоций.
-  const diaryText = entries.map(e => e.content).join('\n');
-  const prompt = `Ниже приведены записи из дневника за последние 3 дня. Сделай следующее:
-1. Сгруппируй похожие записи.
-2. Объедини их в краткие, ёмкие предложения, сохраняя важные эмоции и события.
-3. Удали дубликаты и незначительные детали.
-4. Выдай итоговый сжатый дневник в виде списка (каждая запись с новой строки).
+  const diaryText = entries.join('\n');
+  const prompt = `Ниже записи дневника за последние 3 дня. Сделай краткое резюме: объедини похожее, удали повторы, сохрани важные эмоции и факты. Ответь списком кратких записей.
 
-Записи:
 ${diaryText}`;
 
   const messages = [{ role: 'user', content: prompt }];
   let consolidated = await callOpenRouter(cfg, messages);
   if (!consolidated) consolidated = 'Нет важных событий.';
 
-  // Сохраняем сжатый дневник как новую запись (за сегодня)
-  const todayKey = `diary:${now.toISOString().slice(0, 10)}`;
-  await env.KV_DIARY.put(todayKey, JSON.stringify({
+  await env.KV_DIARY.put(`diary:${now.getTime()}`, JSON.stringify({
     timestamp: now.getTime(),
     content: `[Консолидация] ${consolidated}`,
   }));
 
-  // Удаляем старые записи (кроме сегодняшней)
+  // Удаляем старые записи
   for (const key of keys.keys) {
-    if (key.name !== todayKey) {
-      await env.KV_DIARY.delete(key.name);
-    }
+    await env.KV_DIARY.delete(key.name);
   }
   console.log('Консолидация сна завершена.');
 }
 
 // ============================================================
-//  РАБОЧАЯ ПАМЯТЬ (обновление)
+//  РАБОЧАЯ ПАМЯТЬ
 // ============================================================
 async function updateWorkingMemory(env, userMessage, botReply, cfg) {
-  // Загружаем текущую рабочую память
   let wm = await env.KV_WORKING_MEMORY.get('workingMemory', 'text') || '';
-  // Составляем промт для обновления рабочей памяти
   const prompt = `Текущая рабочая память (задачи, обещания, важные вещи):
 ${wm}
 
@@ -636,13 +553,7 @@ ${wm}
 Андрей: "${userMessage}"
 Валентина: "${botReply}"
 
-Обнови рабочую память:
-- Удали завершённые задачи (если они упоминались).
-- Добавь новые обещания или договорённости.
-- Сохрани важные факты, которые могут понадобиться в ближайшие дни.
-- Структурируй как список.
-
-Ответь только обновлённой рабочей памятью, без лишнего текста.`;
+Обнови рабочую память: удали завершённые, добавь новые задачи/обещания, сохрани важные факты. Ответь только обновлённой рабочей памятью.`;
 
   const messages = [{ role: 'user', content: prompt }];
   let newWm = await callOpenRouter(cfg, messages);
@@ -650,11 +561,3 @@ ${wm}
     await env.KV_WORKING_MEMORY.put('workingMemory', newWm);
   }
 }
-
-// ============================================================
-//  ОБРАБОТКА СООБЩЕНИЙ ОТ ДРУГИХ ПОЛЬЗОВАТЕЛЕЙ (группы/личка)
-// ============================================================
-// (Здесь можно добавить логику для ответов в группы, но для простоты оставим как заглушку)
-// В основном обработчике мы пока проверяем только Андрея. Чтобы добавить другие чаты,
-// нужно получать все диалоги с новыми сообщениями. Это можно сделать через client.getDialogs()
-// и проверять непрочитанные. Но для начала оставим только Андрея, а позже можно расширить.
