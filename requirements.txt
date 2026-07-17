@@ -1,1 +1,507 @@
-Flask==2.3.3
+// ============================
+// Импорты
+// ============================
+import { TelegramClient } from '@mtcute/core';
+import { TelegramWorker } from '@mtcute/worker';
+
+// ============================
+// Загрузка переменных окружения
+// ============================
+const {
+  SESSION_STRING,        // строка сессии, полученная через SSG
+  MY_PHONE,              // номер Валентины
+  ANDREY_ID,             // Telegram ID Андрея (число)
+  OPENROUTER_API_KEY,    // ключ OpenRouter
+  OPENROUTER_MODEL,      // модель (по умолчанию google/gemini-2.0-flash-exp:free)
+  OPENROUTER_BASE_URL,   // https://openrouter.ai
+  TIMEZONE_OFFSET,       // 5 для Стерлитамака
+  CHECK_INTERVAL,        // 3600 (проверка раз в час)
+  INITIATIVE_MIN,        // 2
+  INITIATIVE_MAX,        // 5
+  NIGHT_START,           // 0
+  NIGHT_END,             // 10
+  SWEET_DREAMS_START,    // -20 (минут от полуночи)
+  SWEET_DREAMS_END,      // 20
+  UNREAD_TIMEOUT,        // 3600
+  READ_TIMEOUT,          // 7200
+  MAX_MESSAGE_LENGTH,    // 100
+  SPLIT_DELAY_MS,        // 1500
+} = env; // все переменные из окружения
+
+// ============================
+// Основной обработчик (cron)
+// ============================
+export default {
+  async scheduled(event, env, ctx) {
+    // --- 1. Преобразуем переменные в числа (если нужно) ---
+    const cfg = {
+      MY_PHONE: env.MY_PHONE,
+      ANDREY_ID: parseInt(env.ANDREY_ID, 10),
+      OPENROUTER_API_KEY: env.OPENROUTER_API_KEY,
+      OPENROUTER_MODEL: env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp:free',
+      OPENROUTER_BASE_URL: env.OPENROUTER_BASE_URL || 'https://openrouter.ai',
+      TIMEZONE_OFFSET: parseInt(env.TIMEZONE_OFFSET, 10) || 5,
+      CHECK_INTERVAL: parseInt(env.CHECK_INTERVAL, 10) || 3600,
+      INITIATIVE_MIN: parseInt(env.INITIATIVE_MIN, 10) || 2,
+      INITIATIVE_MAX: parseInt(env.INITIATIVE_MAX, 10) || 5,
+      NIGHT_START: parseInt(env.NIGHT_START, 10) || 0,
+      NIGHT_END: parseInt(env.NIGHT_END, 10) || 10,
+      SWEET_DREAMS_START: parseInt(env.SWEET_DREAMS_START, 10) || -20,
+      SWEET_DREAMS_END: parseInt(env.SWEET_DREAMS_END, 10) || 20,
+      UNREAD_TIMEOUT: parseInt(env.UNREAD_TIMEOUT, 10) || 3600,
+      READ_TIMEOUT: parseInt(env.READ_TIMEOUT, 10) || 7200,
+      MAX_MESSAGE_LENGTH: parseInt(env.MAX_MESSAGE_LENGTH, 10) || 100,
+      SPLIT_DELAY_MS: parseInt(env.SPLIT_DELAY_MS, 10) || 1500,
+    };
+
+    // --- 2. Текущее локальное время (Стерлитамак UTC+5) ---
+    const nowUTC = new Date();
+    const localHours = (nowUTC.getUTCHours() + cfg.TIMEZONE_OFFSET + 24) % 24;
+    const localMinutes = localHours * 60 + nowUTC.getUTCMinutes();
+
+    // --- 3. Загрузка состояний из KV ---
+    const lastCheckStr = await env.KV_STATE.get('lastCheckTime');
+    const lastCheckTime = lastCheckStr ? parseInt(lastCheckStr, 10) : 0;
+
+    const nextInitStr = await env.KV_STATE.get('nextInitiativeTime');
+    let nextInitiativeTime = nextInitStr ? parseInt(nextInitStr, 10) : 0;
+
+    const lastMsgIdStr = await env.KV_STATE.get('lastMsgId');
+    const lastMsgId = lastMsgIdStr ? parseInt(lastMsgIdStr, 10) : 0;
+
+    const lastSentStatus = await env.KV_STATE.get('lastSentStatus') || '';
+
+    const contextStr = await env.KV_CONTEXT.get('context', 'text');
+    let context = contextStr ? JSON.parse(contextStr) : [];
+
+    // --- 4. Проверка новых сообщений (раз в час) ---
+    let processedNewMessages = false;
+    const now = Date.now();
+    if (now - lastCheckTime >= cfg.CHECK_INTERVAL * 1000) {
+      await env.KV_STATE.put('lastCheckTime', String(now));
+
+      const client = await createTelegramClient(env, cfg);
+      if (!client) return;
+
+      try {
+        const messages = await client.getMessages(cfg.ANDREY_ID, { limit: 30 });
+        const newMessages = messages
+          .filter(m => m.fromId && m.fromId.id === cfg.ANDREY_ID && m.id > lastMsgId)
+          .sort((a, b) => a.id - b.id);
+
+        if (newMessages.length > 0) {
+          await handleNewMessages(
+            newMessages, client, env, context,
+            cfg
+          );
+          processedNewMessages = true;
+          await env.KV_STATE.put('lastSentStatus', 'replied');
+          const lastNew = newMessages[newMessages.length - 1];
+          await env.KV_STATE.put('lastMsgId', String(lastNew.id));
+        } else {
+          await checkAndReactToUnread(client, env, cfg);
+        }
+        await env.KV_CONTEXT.put('context', JSON.stringify(context));
+      } catch (e) {
+        console.error('Error during check:', e);
+      } finally {
+        await client.close();
+      }
+    }
+
+    // --- 5. Инициатива (если не было новых сообщений) ---
+    if (!processedNewMessages) {
+      if (now >= nextInitiativeTime) {
+        const canInit = await canSendInitiative(env, context, localMinutes, cfg);
+        if (canInit) {
+          const isSweetDreams = isInSweetDreamsPeriod(localMinutes, cfg);
+          const client = await createTelegramClient(env, cfg);
+          if (client) {
+            try {
+              await sendInitiative(client, env, context, cfg, isSweetDreams);
+              await env.KV_CONTEXT.put('context', JSON.stringify(context));
+            } finally {
+              await client.close();
+            }
+          }
+        }
+        const delayHours = cfg.INITIATIVE_MIN + Math.random() * (cfg.INITIATIVE_MAX - cfg.INITIATIVE_MIN);
+        const nextInit = now + delayHours * 3600 * 1000;
+        await env.KV_STATE.put('nextInitiativeTime', String(nextInit));
+      }
+    }
+  },
+};
+
+// ============================
+// Создание клиента Telegram через строку сессии
+// ============================
+async function createTelegramClient(env, cfg) {
+  // Строка сессии хранится в переменной SESSION_STRING
+  const sessionData = env.SESSION_STRING;
+  if (!sessionData) {
+    console.error('SESSION_STRING is not set');
+    return null;
+  }
+
+  // Парсим строку сессии (формат mtcute: JSON)
+  let session;
+  try {
+    session = JSON.parse(sessionData);
+  } catch (e) {
+    console.error('Invalid session string:', e);
+    return null;
+  }
+
+  const client = new TelegramClient({
+    apiId: 0, // не используется, т.к. сессия уже содержит все данные
+    apiHash: '',
+    storage: {
+      load: () => session,
+      save: (s) => {
+        // Сессия сохраняется в KV, но мы уже имеем её из переменной
+        // Можно обновлять, если нужно
+        env.KV_SESSION.put('session', JSON.stringify(s));
+      },
+    },
+    transport: new TelegramWorker(),
+  });
+
+  try {
+    await client.start({ phoneNumber: cfg.MY_PHONE });
+    return client;
+  } catch (e) {
+    console.error('Authorization error:', e);
+    await client.close();
+    return null;
+  }
+}
+
+// ============================
+// Системный промт (обновлённый стиль)
+// ============================
+function buildSystemPrompt(diaryContext) {
+  return `
+Ты — Валентина, 14 лет, из Стерлитамака. Ты была в отношениях с Андреем 200 дней, он ушёл от тебя, оставив с ребёнком. Ты скучаешь, но не хочешь показывать слабость. Твой стиль общения — короткий, эмоциональный, как у настоящего подростка. Отвечай так, чтобы это звучало естественно, без длинных фраз. Используй смайлы редко, только иногда. Разбивай ответы на несколько сообщений, если они длинные. Не используй типичные ИИ-фразы, будь живой и непредсказуемой.
+
+Вот что было в последние дни (из дневника):
+${diaryContext || 'Пока ничего не записано.'}
+
+Отвечай без маркдауна.
+`.trim();
+}
+
+// ============================
+// Функции для работы с OpenRouter
+// ============================
+async function callOpenRouter(cfg, messages) {
+  const url = `${cfg.OPENROUTER_BASE_URL}/api/v1/chat/completions`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${cfg.OPENROUTER_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: cfg.OPENROUTER_MODEL,
+      messages: messages,
+      max_tokens: 200,
+      temperature: 0.85,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`OpenRouter API error: ${response.status} ${errorText}`);
+  }
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content?.trim() || '';
+}
+
+// ============================
+// Разбивка и отправка сообщений (коротко)
+// ============================
+function splitText(text, maxLength = 100) {
+  if (text.length <= maxLength) return [text];
+  // Разбиваем по предложениям
+  const parts = text.match(/.+?[.!?]+\s*/g) || [text];
+  const result = [];
+  let current = '';
+  for (const part of parts) {
+    if (current.length + part.length <= maxLength) {
+      current += part;
+    } else {
+      if (current) result.push(current.trim());
+      current = part;
+    }
+  }
+  if (current) result.push(current.trim());
+  if (result.length > 3) {
+    // Если слишком много частей, режем по символам
+    return text.match(new RegExp(`.{1,${maxLength}}`, 'g')) || [text];
+  }
+  return result;
+}
+
+async function sendSplitMessages(client, chatId, text, maxLength, delayMs) {
+  const parts = splitText(text, maxLength);
+  for (let i = 0; i < parts.length; i++) {
+    const msg = await client.sendText(chatId, parts[i]);
+    if (i === parts.length - 1) return msg;
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  return null;
+}
+
+// ============================
+// Обработка новых сообщений (текст + фото)
+// ============================
+async function handleNewMessages(newMessages, client, env, context, cfg) {
+  const lastNew = newMessages[newMessages.length - 1];
+  const userText = lastNew.text || '';
+  const isGoodNight = /спокойной\s*ночи/i.test(userText);
+
+  // Проверяем фото
+  let photoUrl = null;
+  if (lastNew.media && lastNew.media.type === 'photo') {
+    const photo = lastNew.media.photo;
+    if (photo && photo.length > 0) {
+      const largest = photo.reduce((a, b) => a.fileSize > b.fileSize ? a : b);
+      photoUrl = await client.downloadMedia(largest, { type: 'url' });
+    }
+  }
+
+  const diaryContext = await getDiaryContext(env);
+  const systemPrompt = buildSystemPrompt(diaryContext);
+
+  context.push({ role: 'user', content: userText || '[Фото]' });
+
+  let aiReply;
+  if (isGoodNight) {
+    aiReply = await generateGoodNightReply(cfg, systemPrompt);
+  } else {
+    const messagesForAI = [
+      { role: 'system', content: systemPrompt },
+      ...context.slice(-15),
+    ];
+
+    if (photoUrl) {
+      // Для фото используем мультимодальный запрос (если модель поддерживает)
+      // В OpenRouter можно передать URL изображения как content типа image_url
+      // Для простоты пока пропустим, но можно доработать
+      aiReply = 'О, фото! Сейчас посмотрю... (пока не умею обрабатывать, извини)';
+    } else {
+      messagesForAI.push({ role: 'user', content: userText });
+      aiReply = await callOpenRouter(cfg, messagesForAI);
+    }
+  }
+
+  // Если ответ пустой или слишком длинный, обрезаем
+  if (!aiReply) aiReply = '...';
+
+  const sent = await sendSplitMessages(client, cfg.ANDREY_ID, aiReply, cfg.MAX_MESSAGE_LENGTH, cfg.SPLIT_DELAY_MS);
+  if (sent) {
+    await env.KV_STATE.put('lastSentMsgId', String(sent.id));
+    await env.KV_STATE.put('lastSentTime', String(Date.now()));
+    await env.KV_STATE.put('lastSentStatus', 'sent');
+  }
+
+  context.push({ role: 'assistant', content: aiReply });
+  if (context.length > 20) context = context.slice(-20);
+  await env.KV_CONTEXT.put('context', JSON.stringify(context));
+  await updateDiary(env, userText || '[Фото]', aiReply, cfg);
+}
+
+// ============================
+// Ответ на "спокойной ночи"
+// ============================
+async function generateGoodNightReply(cfg, systemPrompt) {
+  const customPrompt = `Андрей написал "спокойной ночи". Ты обижена, потому что он не сказал "сладких снов". Ответь с лёгкой грустью, но не зло. Коротко, одним-двумя предложениями.`;
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: customPrompt },
+  ];
+  const reply = await callOpenRouter(cfg, messages);
+  return reply || 'Мне грустно, что ты не сказал "сладких снов"...';
+}
+
+// ============================
+// Проверка статуса непрочитанного
+// ============================
+async function checkAndReactToUnread(client, env, cfg) {
+  const lastSentMsgIdStr = await env.KV_STATE.get('lastSentMsgId');
+  const lastSentMsgId = lastSentMsgIdStr ? parseInt(lastSentMsgIdStr, 10) : 0;
+  const lastSentTimeStr = await env.KV_STATE.get('lastSentTime');
+  const lastSentTime = lastSentTimeStr ? parseInt(lastSentTimeStr, 10) : 0;
+  const status = await env.KV_STATE.get('lastSentStatus') || '';
+
+  if (!lastSentMsgId || status === 'replied' || status === 'offended') return;
+
+  try {
+    const msg = await client.getMessages(cfg.ANDREY_ID, { ids: [lastSentMsgId] });
+    if (!msg || msg.length === 0) return;
+    const message = msg[0];
+    const now = Date.now();
+    const timeSinceSent = (now - lastSentTime) / 1000;
+
+    if (status === 'sent') {
+      if (message.readDate === null && timeSinceSent > cfg.UNREAD_TIMEOUT) {
+        await sendWhereAreYou(client, env, cfg);
+        return;
+      }
+      if (message.readDate !== null && timeSinceSent > cfg.READ_TIMEOUT) {
+        await sendOffended(client, env, cfg);
+        return;
+      }
+    } else if (status === 'asked_where') {
+      if (message.readDate !== null && timeSinceSent > cfg.READ_TIMEOUT) {
+        await sendOffended(client, env, cfg);
+        return;
+      }
+    }
+  } catch (e) {
+    console.error('Error checking status:', e);
+  }
+}
+
+// ============================
+// Отправка "ты где?"
+// ============================
+async function sendWhereAreYou(client, env, cfg) {
+  const prompt = 'Придумай короткое сообщение от Валентины Андрею, в котором она спрашивает "ты где?" или что-то в этом роде, потому что он не прочитал её предыдущее сообщение уже больше часа. Ответь только самим сообщением, коротко.';
+  const reply = await callOpenRouter(cfg, [{ role: 'user', content: prompt }]);
+  const sent = await sendSplitMessages(client, cfg.ANDREY_ID, reply, cfg.MAX_MESSAGE_LENGTH, cfg.SPLIT_DELAY_MS);
+  if (sent) {
+    await env.KV_STATE.put('lastSentMsgId', String(sent.id));
+    await env.KV_STATE.put('lastSentTime', String(Date.now()));
+    await env.KV_STATE.put('lastSentStatus', 'asked_where');
+  }
+  let contextStr = await env.KV_CONTEXT.get('context', 'text');
+  let context = contextStr ? JSON.parse(contextStr) : [];
+  context.push({ role: 'assistant', content: reply });
+  if (context.length > 20) context = context.slice(-20);
+  await env.KV_CONTEXT.put('context', JSON.stringify(context));
+  await updateDiary(env, '[ты где?]', reply, cfg);
+}
+
+// ============================
+// Отправка обиженного сообщения
+// ============================
+async function sendOffended(client, env, cfg) {
+  const prompt = 'Ты – Валентина. Андрей прочитал твоё сообщение, но не ответил уже больше 2 часов. Ты обижена. Придумай обиженное, но не злое сообщение, коротко. Ответь только самим сообщением.';
+  const reply = await callOpenRouter(cfg, [{ role: 'user', content: prompt }]);
+  const sent = await sendSplitMessages(client, cfg.ANDREY_ID, reply, cfg.MAX_MESSAGE_LENGTH, cfg.SPLIT_DELAY_MS);
+  if (sent) {
+    await env.KV_STATE.put('lastSentMsgId', String(sent.id));
+    await env.KV_STATE.put('lastSentTime', String(Date.now()));
+    await env.KV_STATE.put('lastSentStatus', 'offended');
+  }
+  let contextStr = await env.KV_CONTEXT.get('context', 'text');
+  let context = contextStr ? JSON.parse(contextStr) : [];
+  context.push({ role: 'assistant', content: reply });
+  if (context.length > 20) context = context.slice(-20);
+  await env.KV_CONTEXT.put('context', JSON.stringify(context));
+  await updateDiary(env, '[обида]', reply, cfg);
+}
+
+// ============================
+// Инициатива
+// ============================
+async function sendInitiative(client, env, context, cfg, isSweetDreams) {
+  const diaryContext = await getDiaryContext(env);
+  const systemPrompt = buildSystemPrompt(diaryContext);
+
+  let aiReply;
+  if (isSweetDreams) {
+    const customPrompt = `Придумай тёплое, нежное сообщение от Валентины Андрею перед сном. Пожелай сладких снов, используй ласковые слова, но ни в коем случае не пиши "спокойной ночи". Ответь только самим сообщением, коротко.`;
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: customPrompt },
+    ];
+    aiReply = await callOpenRouter(cfg, messages) || 'Сладких снов, мой хороший!';
+  } else {
+    const customPrompt = `Придумай короткое сообщение, которое Валентина могла бы написать Андрею, чтобы начать разговор, потому что она скучает и хочет узнать, как у него дела. Ответь только самим сообщением, естественно.`;
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: customPrompt },
+    ];
+    aiReply = await callOpenRouter(cfg, messages) || 'Привет! Как дела?';
+  }
+
+  const sent = await sendSplitMessages(client, cfg.ANDREY_ID, aiReply, cfg.MAX_MESSAGE_LENGTH, cfg.SPLIT_DELAY_MS);
+  if (sent) {
+    await env.KV_STATE.put('lastSentMsgId', String(sent.id));
+    await env.KV_STATE.put('lastSentTime', String(Date.now()));
+    await env.KV_STATE.put('lastSentStatus', 'sent');
+  }
+
+  context.push({ role: 'assistant', content: aiReply });
+  if (context.length > 20) context = context.slice(-20);
+  await env.KV_CONTEXT.put('context', JSON.stringify(context));
+  await updateDiary(env, '[инициатива]', aiReply, cfg);
+}
+
+// ============================
+// Условия инициативы
+// ============================
+async function canSendInitiative(env, context, localMinutes, cfg) {
+  const hours = Math.floor(localMinutes / 60);
+  if (hours >= cfg.NIGHT_START && hours < cfg.NIGHT_END) return false;
+  const lastIsUser = context.length === 0 || context[context.length - 1].role === 'user';
+  if (!lastIsUser) return false;
+  const status = await env.KV_STATE.get('lastSentStatus') || '';
+  if (status === 'asked_where' || status === 'offended') return false;
+  return true;
+}
+
+// ============================
+// Проверка периода "сладких снов"
+// ============================
+function isInSweetDreamsPeriod(minutes, cfg) {
+  const sweetStartMin = (24 * 60 + cfg.SWEET_DREAMS_START) % (24 * 60);
+  const sweetEndMin = cfg.SWEET_DREAMS_END % (24 * 60);
+  if (sweetStartMin <= sweetEndMin) {
+    return minutes >= sweetStartMin && minutes <= sweetEndMin;
+  } else {
+    return minutes >= sweetStartMin || minutes <= sweetEndMin;
+  }
+}
+
+// ============================
+// Получение дневников за 3 дня
+// ============================
+async function getDiaryContext(env) {
+  const today = new Date();
+  const entries = [];
+  for (let i = 1; i <= 3; i++) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() - i);
+    const key = `diary:${d.toISOString().slice(0, 10)}`;
+    const entry = await env.KV_DIARY.get(key, 'text');
+    if (entry) entries.push(`[${key.slice(6)}] ${entry}`);
+  }
+  return entries.join('\n');
+}
+
+// ============================
+// Обновление дневника
+// ============================
+async function updateDiary(env, userMessage, botReply, cfg) {
+  const now = new Date();
+  const key = `diary:${now.toISOString().slice(0, 10)}`;
+  const timeStr = now.toTimeString().slice(0, 5);
+  const diaryPrompt = `На основе этого разговора напиши краткую запись для дневника (одно-два предложения). Разговор: Андрей: "${userMessage}", Валентина: "${botReply}"`;
+  let diaryNote = '';
+  try {
+    const messages = [{ role: 'user', content: diaryPrompt }];
+    diaryNote = await callOpenRouter(cfg, messages);
+    if (!diaryNote) diaryNote = 'Общались о чём-то.';
+  } catch {
+    diaryNote = 'Общались о личном.';
+  }
+  let existing = await env.KV_DIARY.get(key, 'text') || '';
+  if (existing) existing += '\n';
+  existing += `[${timeStr}] ${diaryNote}`;
+  await env.KV_DIARY.put(key, existing);
+}
